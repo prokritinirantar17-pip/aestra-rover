@@ -478,3 +478,129 @@
 // }
 
 
+// ____________________________________________
+
+/*
+  AESTRA — Dummy Autonomous Movement Test
+  ----------------------------------------
+  Minimal sketch: just drives forward and avoids obstacles using the
+  HC-SR04 ultrasonic sensor and the L298N motor driver. No soil sensor,
+  no LDR, no servo, no LCD, no Wi-Fi — just movement, for your
+  instructor's test.
+
+  Pins (same as the full project's wiring map):
+    L298N IN1 = GPIO25   (LEFT channel)
+    L298N IN2 = GPIO26   (LEFT channel)
+    L298N IN3 = GPIO27   (RIGHT channel)
+    L298N IN4 = GPIO14   (RIGHT channel)
+    HC-SR04 TRIG = GPIO18
+    HC-SR04 ECHO = GPIO19
+
+  Note: ENA/ENB are jumper-capped ON on this build, so there's no PWM/
+  speed control — IN1..IN4 only set direction, motors run at fixed
+  full power.
+*/
+
+#include <Arduino.h>
+
+#define L298N_IN1   25
+#define L298N_IN2   26
+#define L298N_IN3   27
+#define L298N_IN4   14
+
+#define TRIG_PIN    18
+#define ECHO_PIN    19
+
+const int OBSTACLE_DISTANCE_CM = 20;
+const unsigned long AVOID_BACK_MS = 350;
+const unsigned long AVOID_TURN_MS = 500;
+
+void motorsStop() {
+  digitalWrite(L298N_IN1, LOW);
+  digitalWrite(L298N_IN2, LOW);
+  digitalWrite(L298N_IN3, LOW);
+  digitalWrite(L298N_IN4, LOW);
+}
+
+void motorsForward() {
+  digitalWrite(L298N_IN1, HIGH);
+  digitalWrite(L298N_IN2, LOW);
+  digitalWrite(L298N_IN3, HIGH);
+  digitalWrite(L298N_IN4, LOW);
+}
+
+void motorsBackward() {
+  digitalWrite(L298N_IN1, LOW);
+  digitalWrite(L298N_IN2, HIGH);
+  digitalWrite(L298N_IN3, LOW);
+  digitalWrite(L298N_IN4, HIGH);
+}
+
+// Pivot: left side backward, right side forward -> turns left
+void motorsTurnLeft() {
+  digitalWrite(L298N_IN1, LOW);
+  digitalWrite(L298N_IN2, HIGH);
+  digitalWrite(L298N_IN3, HIGH);
+  digitalWrite(L298N_IN4, LOW);
+}
+
+// Pivot: left side forward, right side backward -> turns right
+void motorsTurnRight() {
+  digitalWrite(L298N_IN1, HIGH);
+  digitalWrite(L298N_IN2, LOW);
+  digitalWrite(L298N_IN3, LOW);
+  digitalWrite(L298N_IN4, HIGH);
+}
+
+float readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout (~5m range)
+  if (duration == 0) {
+    return -1; // no echo received
+  }
+  return duration * 0.0343 / 2.0; // convert to cm
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(L298N_IN1, OUTPUT);
+  pinMode(L298N_IN2, OUTPUT);
+  pinMode(L298N_IN3, OUTPUT);
+  pinMode(L298N_IN4, OUTPUT);
+  motorsStop();
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+}
+
+void loop() {
+  float distance = readDistanceCm();
+  Serial.print("Distance: ");
+  Serial.print(distance);
+  Serial.println(" cm");
+
+  if (distance > 0 && distance < OBSTACLE_DISTANCE_CM) {
+    motorsStop();
+    delay(150);
+
+    motorsBackward();
+    delay(AVOID_BACK_MS);
+
+    motorsStop();
+    delay(100);
+
+    motorsTurnRight();
+    delay(AVOID_TURN_MS);
+
+    motorsStop();
+    delay(100);
+  } else {
+    motorsForward();
+  }
+}
