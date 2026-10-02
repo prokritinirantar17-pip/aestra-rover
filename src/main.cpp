@@ -6,13 +6,22 @@
 
   Functionalities implemented (per project PDF):
     1. Autonomous Navigation & Obstacle Avoidance (HC-SR04 + L298N motors)
+       - Drives forward continuously until an obstacle is detected, stops
+         briefly, turns (alternating right/left so it doesn't get stuck
+         bouncing between the same two walls), then resumes forward.
+       - Can be paused/resumed any time from the dashboard Start/Stop button.
     2. Intelligent Environmental & Soil Sensing (Soil moisture + LDR light
        sensor, with a servo that lowers a probe arm into the soil)
-    3. Wireless Telemetry & IoT Dashboard Monitoring (ESP32 Wi-Fi web page
-       that shows live sensor readings, auto-refreshing)
+       - Runs automatically on a timer, OR can be driven manually from a
+         slider on the dashboard (automatic cycle pauses while manual).
+    3. Wireless Telemetry & IoT Dashboard Monitoring (ESP32 Wi-Fi web page)
+       - Live sensor cards, Start/Stop control, manual servo slider,
+         and 3 history charts (line / bar / pie) — all built with plain
+         HTML/CSS/JS served from flash (PROGMEM), no external libraries,
+         so it works fully offline in Access Point mode.
 
   NOT implemented (per your instruction — excluded from the final build):
-    - Buzzer, Push Buttons, Potentiometer, manual/auto toggle
+    - Buzzer, Push Buttons, Potentiometer, manual/auto toggle switch
 
   ------------------------------------------------------------------------
   LIBRARIES TO INSTALL (Arduino Library Manager, or PlatformIO lib_deps):
@@ -39,16 +48,6 @@
     ENA / ENB on the L298N are left with their jumper caps ON (always
     enabled) — so motor speed is fixed at full power, and IN1..IN4 only
     control direction. No PWM / speed control is wired.
-
-  L298N channel layout (one driver, two channels, four motors total —
-  left-front + left-back share one channel, right-front + right-back
-  share the other):
-    IN1/IN2  -> OUT1/OUT2 -> LEFT side motors (front + back, wired parallel)
-    IN3/IN4  -> OUT3/OUT4 -> RIGHT side motors (front + back, wired parallel)
-
-  If the rover drives backward when you meant forward, or spins the wrong
-  way, just swap the HIGH/LOW pair for that side in the functions below —
-  this is normal and just depends on how the motor wires were connected.
   ========================================================================
 */
 
@@ -62,17 +61,11 @@
 // ---------------------------------------------------------------------
 // WI-FI CONFIG (Functionality 3: Wireless Telemetry & IoT Dashboard)
 // ---------------------------------------------------------------------
-// Mode A (default): ESP32 creates its OWN Wi-Fi hotspot. Connect your
-// phone/laptop to this network and open the IP shown on Serial Monitor
-// (usually 192.168.4.1) to see the live dashboard. No home router needed
-// — good for a demo table with no internet.
 #define USE_ACCESS_POINT_MODE true
 
 const char* AP_SSID     = "Aestra-Rover";
 const char* AP_PASSWORD = "aestra123";   // must be at least 8 characters
 
-// Mode B: connect to your home/school Wi-Fi instead. Set the flag above
-// to false and fill these in.
 const char* STA_SSID     = "Think Tank _ 04";
 const char* STA_PASSWORD = "thinktank14312";
 
@@ -97,8 +90,6 @@ WebServer server(80);
 #define SOIL_PIN       34   // analog, input-only
 #define LDR_PIN        35   // analog, input-only
 
-// I2C LCD address is commonly 0x27 or 0x3F — if the screen stays blank,
-// try changing this to 0x3F.
 #define LCD_ADDRESS    0x27
 #define LCD_COLS       16
 #define LCD_ROWS       2
@@ -106,31 +97,32 @@ WebServer server(80);
 // ---------------------------------------------------------------------
 // TUNABLE CONSTANTS — calibrate these to your own hardware
 // ---------------------------------------------------------------------
-const int OBSTACLE_DISTANCE_CM   = 20;    // stop/turn if something is closer than this
-const unsigned long AVOID_BACK_MS  = 350; // how long to reverse when avoiding
-const unsigned long AVOID_TURN_MS  = 500; // how long to turn when avoiding
+const int OBSTACLE_DISTANCE_CM     = 20;    // stop/turn if something is closer than this
+const unsigned long STOP_PAUSE_MS  = 400;   // "stop for a while" before turning
+const unsigned long AVOID_TURN_MS  = 500;   // how long to turn when avoiding
 
-const unsigned long SENSOR_READ_INTERVAL_MS = 2000;  // soil/light/DHT read rate
+const unsigned long SENSOR_READ_INTERVAL_MS = 2000;  // soil/light/DHT read rate (also history tick)
 const unsigned long LCD_SWITCH_INTERVAL_MS  = 3000;  // how often LCD screen flips
 const unsigned long DISTANCE_CHECK_INTERVAL_MS = 100; // obstacle check rate
 
-const unsigned long SOIL_PROBE_INTERVAL_MS = 30000;  // how often to dip the probe
+const unsigned long SOIL_PROBE_INTERVAL_MS = 30000;  // how often to auto-dip the probe
 const unsigned long SOIL_PROBE_DWELL_MS    = 2000;   // how long probe stays down
 
-// Soil sensor raw ADC calibration (12-bit ESP32 ADC: 0-4095).
-// Many resistive soil sensors read HIGH when dry and LOW when wet —
-// dip the probe in a dry vs. wet sample and update these two numbers.
 const int SOIL_RAW_DRY = 4095;
 const int SOIL_RAW_WET = 1500;
 
-// LDR voltage-divider calibration (LDR to 3.3V, 10k resistor to GND,
-// junction to GPIO35). Reading rises as light increases with this wiring.
 const int LDR_RAW_DARK   = 300;
 const int LDR_RAW_BRIGHT = 4095;
 
-// Servo angles for the soil probe arm
+// Servo angles for the soil probe arm. The dashboard slider is capped to
+// this same 0-90 range — if you change SERVO_DOWN_ANGLE, also update the
+// slider's "max" attribute inside INDEX_HTML below.
 const int SERVO_UP_ANGLE   = 0;    // resting / traveling position
 const int SERVO_DOWN_ANGLE = 90;   // lowered into the soil
+
+// How many sensor readings to keep for the dashboard history charts.
+// At a 2s read interval, 30 samples = 1 minute of history.
+#define HISTORY_SIZE 30
 
 // ---------------------------------------------------------------------
 // GLOBAL OBJECTS
@@ -140,7 +132,7 @@ Servo probeServo;
 LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLS, LCD_ROWS);
 
 // ---------------------------------------------------------------------
-// LIVE SENSOR STATE (shared between loop() logic, LCD, and web dashboard)
+// LIVE SENSOR STATE
 // ---------------------------------------------------------------------
 float g_distanceCm   = -1;
 int   g_soilPercent  = 0;
@@ -150,20 +142,36 @@ float g_humidityPct  = 0;
 bool  g_probeDown     = false;
 bool  g_obstacleAvoiding = false;
 
-// Timers
+bool g_running = true;
+bool g_lastTurnWasRight = true;
+
+bool g_manualServoActive = false;
+int  g_currentServoAngle = SERVO_UP_ANGLE;
+
+float g_histDistance[HISTORY_SIZE];
+int   g_histSoil[HISTORY_SIZE];
+int   g_histLight[HISTORY_SIZE];
+float g_histTemp[HISTORY_SIZE];
+float g_histHumidity[HISTORY_SIZE];
+int   g_histIndex = 0;
+int   g_histCount = 0;
+
+unsigned long g_statusNavigatingMs = 0;
+unsigned long g_statusAvoidingMs   = 0;
+unsigned long g_statusStoppedMs    = 0;
+
 unsigned long t_lastDistanceCheck = 0;
 unsigned long t_lastSensorRead    = 0;
 unsigned long t_lastLcdSwitch     = 0;
 unsigned long t_lastSoilProbe     = 0;
 unsigned long t_lastWifiCheck     = 0;
+unsigned long t_lastStatusTick    = 0;
 bool lcdShowingScreenA = true;
 
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 10000;
 
 // ========================================================================
 // MOTOR CONTROL
-// (ENA/ENB are jumper-capped ON, so these pins only set direction —
-//  there is no speed/PWM control on this build.)
 // ========================================================================
 void motorsStop() {
   digitalWrite(L298N_IN1, LOW);
@@ -186,7 +194,6 @@ void motorsBackward() {
   digitalWrite(L298N_IN4, HIGH);
 }
 
-// Pivot turn: spin left side backward, right side forward -> turns left
 void motorsTurnLeft() {
   digitalWrite(L298N_IN1, LOW);
   digitalWrite(L298N_IN2, HIGH);
@@ -194,7 +201,6 @@ void motorsTurnLeft() {
   digitalWrite(L298N_IN4, LOW);
 }
 
-// Pivot turn: spin left side forward, right side backward -> turns right
 void motorsTurnRight() {
   digitalWrite(L298N_IN1, HIGH);
   digitalWrite(L298N_IN2, LOW);
@@ -212,31 +218,38 @@ float readDistanceCm() {
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  // 30000us timeout ~ 5m range, avoids blocking forever if no echo returns
   long duration = pulseIn(ECHO_PIN, HIGH, 30000);
   if (duration == 0) {
-    return -1;  // no echo received (out of range or misread)
+    return -1;
   }
-  return duration * 0.0343 / 2.0;  // speed of sound conversion -> cm
+  return duration * 0.0343 / 2.0;
 }
 
 // ========================================================================
 // OBSTACLE AVOIDANCE (Functionality 1)
+// Drive forward continuously -> on obstacle, stop for a beat, turn
+// (alternating right/left so it doesn't ping-pong in a corner), then
+// go back to driving forward. Fully paused by the Start/Stop button.
 // ========================================================================
 void handleObstacleAvoidance() {
+  if (!g_running) {
+    motorsStop();
+    g_obstacleAvoiding = false;
+    return;
+  }
+
   if (g_distanceCm > 0 && g_distanceCm < OBSTACLE_DISTANCE_CM) {
     g_obstacleAvoiding = true;
 
     motorsStop();
-    delay(150);
+    delay(STOP_PAUSE_MS);
 
-    motorsBackward();
-    delay(AVOID_BACK_MS);
-
-    motorsStop();
-    delay(100);
-
-    motorsTurnRight();
+    if (g_lastTurnWasRight) {
+      motorsTurnLeft();
+    } else {
+      motorsTurnRight();
+    }
+    g_lastTurnWasRight = !g_lastTurnWasRight;
     delay(AVOID_TURN_MS);
 
     motorsStop();
@@ -251,6 +264,17 @@ void handleObstacleAvoidance() {
 // ========================================================================
 // SOIL + LIGHT + DHT SENSING (Functionality 2)
 // ========================================================================
+void pushHistory() {
+  g_histDistance[g_histIndex] = g_distanceCm;
+  g_histSoil[g_histIndex]     = g_soilPercent;
+  g_histLight[g_histIndex]    = g_lightPercent;
+  g_histTemp[g_histIndex]     = g_temperatureC;
+  g_histHumidity[g_histIndex] = g_humidityPct;
+
+  g_histIndex = (g_histIndex + 1) % HISTORY_SIZE;
+  if (g_histCount < HISTORY_SIZE) g_histCount++;
+}
+
 void readEnvironmentSensors() {
   int rawSoil = analogRead(SOIL_PIN);
   int rawLdr  = analogRead(LDR_PIN);
@@ -265,10 +289,10 @@ void readEnvironmentSensors() {
   float t = dht.readTemperature();
   if (!isnan(h)) g_humidityPct = h;
   if (!isnan(t)) g_temperatureC = t;
+
+  pushHistory();
 }
 
-// Periodically pause the rover, lower the probe arm into the soil, take a
-// fresh moisture reading, then raise it again.
 void handleSoilProbeCycle() {
   unsigned long now = millis();
   if (now - t_lastSoilProbe < SOIL_PROBE_INTERVAL_MS) return;
@@ -277,6 +301,7 @@ void handleSoilProbeCycle() {
   motorsStop();
 
   g_probeDown = true;
+  g_currentServoAngle = SERVO_DOWN_ANGLE;
   probeServo.write(SERVO_DOWN_ANGLE);
   delay(SOIL_PROBE_DWELL_MS);
 
@@ -284,6 +309,7 @@ void handleSoilProbeCycle() {
   g_soilPercent = constrain(map(rawSoil, SOIL_RAW_DRY, SOIL_RAW_WET, 0, 100), 0, 100);
 
   probeServo.write(SERVO_UP_ANGLE);
+  g_currentServoAngle = SERVO_UP_ANGLE;
   delay(500);
   g_probeDown = false;
 }
@@ -302,13 +328,15 @@ void updateLcd() {
     lcd.setCursor(0, 0);
     lcd.print("Dist:");
     if (g_distanceCm > 0) lcd.print(g_distanceCm, 0); else lcd.print("--");
-    lcd.print("cm");
+    lcd.print("cm ");
+    lcd.print(g_running ? (g_obstacleAvoiding ? "AVD" : "RUN") : "STP");
 
     lcd.setCursor(0, 1);
     lcd.print("Soil:");
     lcd.print(g_soilPercent);
     lcd.print("%");
     if (g_probeDown) lcd.print(" DOWN");
+    else if (g_manualServoActive) lcd.print(" MAN");
   } else {
     lcd.setCursor(0, 0);
     lcd.print("Light:");
@@ -325,46 +353,326 @@ void updateLcd() {
 }
 
 // ========================================================================
-// WEB DASHBOARD (Functionality 3)
+// STATUS TIME TRACKING (feeds the dashboard pie chart)
 // ========================================================================
+void updateStatusTimers() {
+  unsigned long now = millis();
+  unsigned long delta = now - t_lastStatusTick;
+  t_lastStatusTick = now;
+
+  if (!g_running) {
+    g_statusStoppedMs += delta;
+  } else if (g_obstacleAvoiding) {
+    g_statusAvoidingMs += delta;
+  } else {
+    g_statusNavigatingMs += delta;
+  }
+}
+
+// ========================================================================
+// JSON HELPERS for the history arrays
+// ========================================================================
+String intArrayToJson(int* arr, int count, int startIdx, int size) {
+  String out = "[";
+  for (int i = 0; i < count; i++) {
+    int idx = (startIdx + i) % size;
+    out += String(arr[idx]);
+    if (i < count - 1) out += ",";
+  }
+  out += "]";
+  return out;
+}
+
+String floatArrayToJson(float* arr, int count, int startIdx, int size) {
+  String out = "[";
+  for (int i = 0; i < count; i++) {
+    int idx = (startIdx + i) % size;
+    out += String(arr[idx], 1);
+    if (i < count - 1) out += ",";
+  }
+  out += "]";
+  return out;
+}
+
+// ========================================================================
+// WEB DASHBOARD (Functionality 3)
+// Served as a single static page from flash (PROGMEM) — loaded once,
+// then updated live via a small JSON endpoint polled every 1.5s. This
+// avoids rebuilding + re-sending a full HTML page (and a full browser
+// reload) every refresh, which is both slower and heavier than this
+// fetch-based approach.
+// ========================================================================
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Aestra Rover Dashboard</title>
+<style>
+  :root{--green:#2e8b57;--orange:#e8a93d;--red:#c0392b;--blue:#3b82c4;--bg:#f4f6f0;--card:#ffffff;--text:#2c3e2d;}
+  *{box-sizing:border-box;}
+  body{font-family:'Segoe UI',Arial,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:20px;}
+  h1{text-align:center;color:var(--green);margin-bottom:4px;}
+  .subtitle{text-align:center;color:#888;font-size:13px;margin-bottom:20px;}
+  .grid{display:flex;flex-wrap:wrap;gap:14px;justify-content:center;margin-bottom:24px;}
+  .card{background:var(--card);border-radius:14px;box-shadow:0 2px 10px rgba(0,0,0,0.08);padding:16px 24px;min-width:120px;text-align:center;}
+  .card .icon{font-size:22px;}
+  .card .label{font-size:12px;color:#888;margin-top:4px;}
+  .card .value{font-size:24px;font-weight:700;margin-top:2px;}
+  .low{color:var(--red);} .mid{color:var(--orange);} .high{color:var(--green);}
+  .controls{display:flex;flex-wrap:wrap;gap:20px;justify-content:center;align-items:center;background:var(--card);border-radius:14px;padding:16px;margin-bottom:24px;box-shadow:0 2px 10px rgba(0,0,0,0.08);}
+  .btn{border:none;border-radius:10px;padding:12px 26px;font-size:16px;font-weight:700;color:#fff;cursor:pointer;}
+  .btn-start{background:var(--green);}
+  .btn-stop{background:var(--red);}
+  .badge{display:inline-block;padding:5px 16px;border-radius:20px;color:#fff;font-size:13px;font-weight:700;}
+  .badge-green{background:var(--green);} .badge-orange{background:var(--orange);} .badge-red{background:var(--red);}
+  .slider-box{display:flex;flex-direction:column;align-items:center;}
+  .slider-box label{font-size:13px;margin-bottom:4px;}
+  input[type=range]{width:200px;}
+  .charts{display:flex;flex-wrap:wrap;gap:16px;justify-content:center;}
+  .chart-card{background:var(--card);border-radius:14px;box-shadow:0 2px 10px rgba(0,0,0,0.08);padding:16px;text-align:center;}
+  .chart-card h3{margin:0 0 10px 0;font-size:14px;color:#555;}
+  .legend{display:flex;gap:10px;justify-content:center;margin-top:8px;font-size:12px;flex-wrap:wrap;}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px;}
+  footer{text-align:center;color:#aaa;font-size:11px;margin-top:24px;}
+</style>
+</head>
+<body>
+<h1>Aestra Rover</h1>
+<div class='subtitle'>Live Telemetry &amp; Control Dashboard</div>
+
+<div class='controls'>
+  <span id='statusBadge' class='badge badge-green'>NAVIGATING</span>
+  <button id='startStopBtn' class='btn btn-stop'>Stop</button>
+  <div class='slider-box'>
+    <label for='servoSlider'>Soil Probe Position: <span id='servoAngleLabel'>0&deg;</span></label>
+    <input type='range' id='servoSlider' min='0' max='90' value='0'>
+    <label style='font-size:12px;margin-top:6px;'><input type='checkbox' id='manualToggle'> Manual control</label>
+  </div>
+</div>
+
+<div class='grid'>
+  <div class='card'><div class='icon'>&#128207;</div><div class='value' id='distance'>--</div><div class='label'>Distance</div></div>
+  <div class='card'><div class='icon'>&#127793;</div><div class='value' id='soil'>--</div><div class='label'>Soil Moisture</div></div>
+  <div class='card'><div class='icon'>&#128161;</div><div class='value' id='light'>--</div><div class='label'>Ambient Light</div></div>
+  <div class='card'><div class='icon'>&#127777;</div><div class='value' id='temp'>--</div><div class='label'>Air Temperature</div></div>
+  <div class='card'><div class='icon'>&#128167;</div><div class='value' id='humidity'>--</div><div class='label'>Humidity</div></div>
+  <div class='card'><div class='icon'>&#9995;</div><div class='value' id='probe'>--</div><div class='label'>Soil Probe</div></div>
+</div>
+
+<div class='charts'>
+  <div class='chart-card'><h3>Soil Moisture History</h3><canvas id='chartLine' width='260' height='140'></canvas></div>
+  <div class='chart-card'><h3>Current Snapshot</h3><canvas id='chartBar' width='260' height='140'></canvas></div>
+  <div class='chart-card'><h3>Status Distribution</h3><canvas id='chartPie' width='140' height='140'></canvas>
+    <div class='legend'>
+      <span><span class='dot' style='background:#2e8b57'></span>Navigating</span>
+      <span><span class='dot' style='background:#e8a93d'></span>Avoiding</span>
+      <span><span class='dot' style='background:#c0392b'></span>Stopped</span>
+    </div>
+  </div>
+</div>
+
+<footer>Auto-updating every 1.5s &middot; Aestra Final Project</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+let runningState = true;
+let manualDragging = false;
+
+function colorize(id, val){
+  const el = $(id);
+  el.classList.remove('low','mid','high');
+  if (val < 30) el.classList.add('low');
+  else if (val < 70) el.classList.add('mid');
+  else el.classList.add('high');
+}
+
+function drawLineChart(canvas, data, color){
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  if (!data || data.length < 2) { ctx.fillStyle='#aaa'; ctx.font='12px Arial'; ctx.textAlign='center'; ctx.fillText('Gathering data...', w/2, h/2); return; }
+  const max = Math.max(...data, 1);
+  const min = Math.min(...data, 0);
+  const range = (max - min) || 1;
+  const stepX = w / (data.length - 1);
+  ctx.beginPath();
+  data.forEach((v,i)=>{
+    const x = i*stepX;
+    const y = h - ((v - min)/range)*(h-10) - 5;
+    if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  });
+  ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+  ctx.lineTo(w,h); ctx.lineTo(0,h); ctx.closePath();
+  ctx.fillStyle = color + '33'; ctx.fill();
+}
+
+function drawBarChart(canvas, labels, data, colors){
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  const max = 100;
+  const gap = w/data.length;
+  const barW = gap*0.5;
+  data.forEach((v,i)=>{
+    const barH = (Math.max(0,Math.min(v,100))/max)*(h-30);
+    const x = i*gap + (gap-barW)/2;
+    const y = h-barH-16;
+    ctx.fillStyle = colors[i];
+    ctx.fillRect(x,y,barW,barH);
+    ctx.fillStyle = '#555';
+    ctx.font='11px Arial';
+    ctx.textAlign='center';
+    ctx.fillText(labels[i], x+barW/2, h-3);
+    ctx.fillText(v+'%', x+barW/2, y-4);
+  });
+}
+
+function drawPieChart(canvas, data, colors){
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0,0,w,h);
+  const total = data.reduce((a,b)=>a+b,0) || 1;
+  const cx=w/2, cy=h/2, r=Math.min(w,h)/2-4;
+  let start=-Math.PI/2;
+  data.forEach((v,i)=>{
+    const angle = (v/total)*Math.PI*2;
+    ctx.beginPath();
+    ctx.moveTo(cx,cy);
+    ctx.arc(cx,cy,r,start,start+angle);
+    ctx.closePath();
+    ctx.fillStyle=colors[i];
+    ctx.fill();
+    start+=angle;
+  });
+}
+
+async function refresh(){
+  try {
+    const res = await fetch('/api/data');
+    const d = await res.json();
+    runningState = d.running;
+
+    $('distance').textContent = d.distance > 0 ? d.distance.toFixed(0)+' cm' : '--';
+    $('soil').textContent = d.soil+'%';
+    $('light').textContent = d.light+'%';
+    $('temp').textContent = d.temp.toFixed(1)+' \u00b0C';
+    $('humidity').textContent = d.humidity.toFixed(0)+'%';
+    $('probe').textContent = d.probeDown ? 'LOWERED' : 'UP';
+
+    colorize('soil', d.soil);
+    colorize('light', d.light);
+    colorize('humidity', d.humidity);
+
+    const badge = $('statusBadge');
+    if (!d.running) { badge.textContent='STOPPED'; badge.className='badge badge-red'; }
+    else if (d.avoiding) { badge.textContent='AVOIDING'; badge.className='badge badge-orange'; }
+    else { badge.textContent='NAVIGATING'; badge.className='badge badge-green'; }
+
+    const btn = $('startStopBtn');
+    btn.textContent = d.running ? 'Stop' : 'Start';
+    btn.className = 'btn ' + (d.running ? 'btn-stop' : 'btn-start');
+
+    if (!manualDragging) {
+      $('servoSlider').value = d.servoAngle;
+      $('servoAngleLabel').textContent = d.servoAngle + '\u00b0';
+    }
+    $('manualToggle').checked = d.manualServo;
+
+    drawLineChart($('chartLine'), d.historySoil, '#2e8b57');
+    drawBarChart($('chartBar'), ['Soil','Light','Humid'], [d.soil, d.light, Math.round(d.humidity)], ['#2e8b57','#e8a93d','#3b82c4']);
+    drawPieChart($('chartPie'), [d.statusNavigating, d.statusAvoiding, d.statusStopped], ['#2e8b57','#e8a93d','#c0392b']);
+  } catch (e) { /* network hiccup, next poll will retry */ }
+}
+
+$('startStopBtn').addEventListener('click', ()=>{
+  fetch(runningState ? '/api/stop' : '/api/start').then(refresh);
+});
+
+const slider = $('servoSlider');
+slider.addEventListener('input', ()=>{
+  manualDragging = true;
+  $('servoAngleLabel').textContent = slider.value + '\u00b0';
+});
+slider.addEventListener('change', ()=>{
+  fetch('/api/servo?angle=' + slider.value).then(()=>{ manualDragging=false; refresh(); });
+});
+
+$('manualToggle').addEventListener('change', (e)=>{
+  if (!e.target.checked) fetch('/api/servo_auto').then(refresh);
+  else fetch('/api/servo?angle=' + slider.value).then(refresh);
+});
+
+setInterval(refresh, 1500);
+refresh();
+</script>
+</body>
+</html>
+)rawliteral";
+
 void handleRoot() {
-  String html = "<!DOCTYPE html><html><head>";
-  html += "<meta http-equiv='refresh' content='2'>";
-  html += "<title>Aestra Rover Dashboard</title>";
-  html += "<style>body{font-family:Arial, sans-serif; background:#f4f6f0; color:#2c3e2d; text-align:center; padding:30px;}";
-  html += "h1{color:#3d6b35;} .card{background:#fff; border-radius:12px; box-shadow:0 2px 8px rgba(0,0,0,0.1); display:inline-block; padding:20px 40px; margin:10px;}";
-  html += ".value{font-size:28px; font-weight:bold;} .label{font-size:14px; color:#666;}</style>";
-  html += "</head><body>";
-  html += "<h1>Aestra Rover — Live Telemetry</h1>";
+  server.send_P(200, "text/html", INDEX_HTML);
+}
 
-  html += "<div class='card'><div class='label'>Distance to Obstacle</div><div class='value'>";
-  html += (g_distanceCm > 0 ? String(g_distanceCm, 0) : "--");
-  html += " cm</div></div>";
+void handleApiData() {
+  int startIdx = (g_histIndex - g_histCount + HISTORY_SIZE) % HISTORY_SIZE;
 
-  html += "<div class='card'><div class='label'>Soil Moisture</div><div class='value'>";
-  html += String(g_soilPercent) + " %</div></div>";
+  String json = "{";
+  json += "\"running\":" + String(g_running ? "true" : "false") + ",";
+  json += "\"distance\":" + String(g_distanceCm, 1) + ",";
+  json += "\"soil\":" + String(g_soilPercent) + ",";
+  json += "\"light\":" + String(g_lightPercent) + ",";
+  json += "\"temp\":" + String(g_temperatureC, 1) + ",";
+  json += "\"humidity\":" + String(g_humidityPct, 1) + ",";
+  json += "\"probeDown\":" + String(g_probeDown ? "true" : "false") + ",";
+  json += "\"avoiding\":" + String(g_obstacleAvoiding ? "true" : "false") + ",";
+  json += "\"manualServo\":" + String(g_manualServoActive ? "true" : "false") + ",";
+  json += "\"servoAngle\":" + String(g_currentServoAngle) + ",";
+  json += "\"statusNavigating\":" + String(g_statusNavigatingMs) + ",";
+  json += "\"statusAvoiding\":" + String(g_statusAvoidingMs) + ",";
+  json += "\"statusStopped\":" + String(g_statusStoppedMs) + ",";
+  json += "\"historySoil\":" + intArrayToJson(g_histSoil, g_histCount, startIdx, HISTORY_SIZE) + ",";
+  json += "\"historyLight\":" + intArrayToJson(g_histLight, g_histCount, startIdx, HISTORY_SIZE) + ",";
+  json += "\"historyDistance\":" + floatArrayToJson(g_histDistance, g_histCount, startIdx, HISTORY_SIZE) + ",";
+  json += "\"historyTemp\":" + floatArrayToJson(g_histTemp, g_histCount, startIdx, HISTORY_SIZE) + ",";
+  json += "\"historyHumidity\":" + floatArrayToJson(g_histHumidity, g_histCount, startIdx, HISTORY_SIZE);
+  json += "}";
 
-  html += "<div class='card'><div class='label'>Ambient Light</div><div class='value'>";
-  html += String(g_lightPercent) + " %</div></div>";
+  server.send(200, "application/json", json);
+}
 
-  html += "<div class='card'><div class='label'>Air Temperature</div><div class='value'>";
-  html += String(g_temperatureC, 1) + " &deg;C</div></div>";
+void handleServoSet() {
+  if (server.hasArg("angle")) {
+    int angle = server.arg("angle").toInt();
+    angle = constrain(angle, SERVO_UP_ANGLE, SERVO_DOWN_ANGLE);
+    g_manualServoActive = true;
+    g_currentServoAngle = angle;
+    probeServo.write(angle);
+    g_probeDown = (angle > (SERVO_DOWN_ANGLE / 2));
+  }
+  server.send(200, "text/plain", "ok");
+}
 
-  html += "<div class='card'><div class='label'>Humidity</div><div class='value'>";
-  html += String(g_humidityPct, 0) + " %</div></div>";
+void handleServoAuto() {
+  g_manualServoActive = false;
+  g_currentServoAngle = SERVO_UP_ANGLE;
+  g_probeDown = false;
+  probeServo.write(SERVO_UP_ANGLE);
+  t_lastSoilProbe = millis();
+  server.send(200, "text/plain", "ok");
+}
 
-  html += "<div class='card'><div class='label'>Soil Probe</div><div class='value'>";
-  html += (g_probeDown ? "LOWERED" : "UP");
-  html += "</div></div>";
+void handleStart() {
+  g_running = true;
+  server.send(200, "text/plain", "ok");
+}
 
-  html += "<div class='card'><div class='label'>Status</div><div class='value'>";
-  html += (g_obstacleAvoiding ? "Avoiding obstacle" : "Navigating");
-  html += "</div></div>";
-
-  html += "<p style='color:#999; font-size:12px;'>Page auto-refreshes every 2 seconds.</p>";
-  html += "</body></html>";
-
-  server.send(200, "text/html", html);
+void handleStop() {
+  g_running = false;
+  motorsStop();
+  g_obstacleAvoiding = false;
+  server.send(200, "text/plain", "ok");
 }
 
 // ========================================================================
@@ -391,7 +699,7 @@ void setup() {
   probeServo.attach(SERVO_PIN, 500, 2400);
   probeServo.write(SERVO_UP_ANGLE);
 
-  Wire.begin(21, 22); // SDA, SCL
+  Wire.begin(21, 22);
   lcd.init();
   lcd.backlight();
   lcd.setCursor(0, 0);
@@ -399,9 +707,8 @@ void setup() {
   lcd.setCursor(0, 1);
   lcd.print("Booting...");
 
-  // --- Wi-Fi ---
-  WiFi.persistent(false);          // don't stash stale credentials in flash
-  WiFi.setSleep(WIFI_PS_NONE);     // keep radio awake so the web dashboard stays reachable
+  WiFi.persistent(false);
+  WiFi.setSleep(WIFI_PS_NONE);
 
   if (USE_ACCESS_POINT_MODE) {
     WiFi.mode(WIFI_AP);
@@ -430,7 +737,14 @@ void setup() {
   }
 
   server.on("/", handleRoot);
+  server.on("/api/data", handleApiData);
+  server.on("/api/start", handleStart);
+  server.on("/api/stop", handleStop);
+  server.on("/api/servo", handleServoSet);
+  server.on("/api/servo_auto", handleServoAuto);
   server.begin();
+
+  t_lastStatusTick = millis();
 
   delay(1000);
   lcd.clear();
@@ -454,25 +768,24 @@ void handleWifiReconnect() {
 void loop() {
   server.handleClient();
   handleWifiReconnect();
+  updateStatusTimers();
 
   unsigned long now = millis();
 
-  // 1) Distance check + obstacle avoidance (highest priority, most frequent)
   if (now - t_lastDistanceCheck >= DISTANCE_CHECK_INTERVAL_MS) {
     t_lastDistanceCheck = now;
     g_distanceCm = readDistanceCm();
     handleObstacleAvoidance();
   }
 
-  // 2) Environmental sensing (soil, light, temp, humidity)
   if (now - t_lastSensorRead >= SENSOR_READ_INTERVAL_MS) {
     t_lastSensorRead = now;
     readEnvironmentSensors();
   }
 
-  // 3) Periodic soil probe dip
-  handleSoilProbeCycle();
+  if (!g_manualServoActive) {
+    handleSoilProbeCycle();
+  }
 
-  // 4) LCD refresh
   updateLcd();
 }
