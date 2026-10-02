@@ -411,7 +411,6 @@ void updateSoilProbeCycle() {
       }
       break;
 
-    case PROBE_IDLE:
     default:
       break;
   }
