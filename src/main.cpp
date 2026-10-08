@@ -63,6 +63,7 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
+#include <esp_system.h>   // esp_reset_reason(): tells us WHY the chip last rebooted
 
 // ---------------------------------------------------------------------
 // WI-FI CONFIG
@@ -263,6 +264,14 @@ void updateObstacleAvoidance() {
     return;
   }
 
+  // While the soil probe is dipping, hold the motors still. (Previously this
+  // function set "forward" and the probe routine set "stop" in the same loop
+  // pass, so the motors got rapid on/off pulses and current spikes.)
+  if (probeState != PROBE_IDLE) {
+    motorsStop();
+    return;
+  }
+
   unsigned long now = millis();
   switch (avoidState) {
     case AVOID_IDLE:
@@ -380,7 +389,11 @@ void updateSoilProbeCycle() {
 
   switch (probeState) {
     case PROBE_IDLE:
-      if (now - t_lastSoilProbe >= SOIL_PROBE_INTERVAL_MS) {
+      // Automatic dips only start while the rover is in AUTO mode. Before,
+      // the servo would suddenly swing 30s after boot even when STOPPED,
+      // adding an unexpected current spike on a weak power supply.
+      if (g_running && !g_manualDriveActive &&
+          now - t_lastSoilProbe >= SOIL_PROBE_INTERVAL_MS) {
         t_lastSoilProbe = now;
         g_probeDown = true;
         g_probeDipCount++;
@@ -925,6 +938,7 @@ void handleServoAuto() {
 }
 
 void handleStart() {
+  if (!g_running) t_lastSoilProbe = millis();   // first dip happens one full interval after AUTO starts
   g_running = true;
   g_manualDriveActive = false;
   motorsStop();
@@ -968,6 +982,25 @@ void handleDrive() {
 }
 
 // ========================================================================
+// BOOT DIAGNOSTICS — short text (max 9 chars, fits the 16x2 LCD) for why
+// the ESP32 last restarted. "BROWNOUT" = the supply voltage dipped too
+// low (the classic symptom of a weak/shared power source).
+// ========================================================================
+const char* resetReasonText(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "POWER-ON";
+    case ESP_RST_EXT:       return "EXT-RESET";
+    case ESP_RST_SW:        return "SOFTWARE";
+    case ESP_RST_PANIC:     return "CRASH";
+    case ESP_RST_INT_WDT:   return "WATCHDOG";
+    case ESP_RST_TASK_WDT:  return "WATCHDOG";
+    case ESP_RST_WDT:       return "WATCHDOG";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT";
+    default:                return "OTHER";
+  }
+}
+
+// ========================================================================
 // SETUP
 // ========================================================================
 void setup() {
@@ -998,8 +1031,19 @@ void setup() {
   lcd.setCursor(0, 1);
   lcd.print("Booting...");
 
+  // Report why we (re)started — on Serial and on the LCD for ~1.5s.
+  const char* why = resetReasonText(esp_reset_reason());
+  Serial.print("Reset reason: ");
+  Serial.println(why);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Reset: ");
+  lcd.print(why);
+  lcd.setCursor(0, 1);
+  lcd.print("Booting...");
+  delay(1500);
+
   WiFi.persistent(false);
-  WiFi.setSleep(WIFI_PS_NONE);
 
   if (USE_ACCESS_POINT_MODE) {
     WiFi.mode(WIFI_AP);
@@ -1026,6 +1070,8 @@ void setup() {
       Serial.println("\nCould not connect — will keep retrying in loop().");
     }
   }
+
+  WiFi.setSleep(WIFI_PS_NONE);   // must come after WiFi.mode()/begin(), otherwise it is ignored
 
   server.on("/", handleRoot);
   server.on("/api/data", handleApiData);
