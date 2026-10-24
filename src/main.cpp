@@ -106,7 +106,7 @@ WebServer server(80);
 #define ECHO_PIN       19
 #define SOIL_PIN       34
 #define LDR_PIN        35
-#define LCD_ADDRESS    0x27
+#define LCD_ADDRESS   0x3F
 #define LCD_COLS       16
 #define LCD_ROWS       2
 
