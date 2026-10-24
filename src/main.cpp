@@ -145,7 +145,28 @@ const unsigned long DRIVE_WATCHDOG_MS = 800;       // auto-stop if joystick sign
 // ---------------------------------------------------------------------
 DHT dht(DHT_PIN, DHT_TYPE);
 Servo probeServo;
-LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLS, LCD_ROWS);
+// ---- LCD with automatic I2C address detection ----
+LiquidCrystal_I2C* lcdPtr = nullptr;
+#define lcd (*lcdPtr)
+
+void lcdBegin() {
+  uint8_t found = 0;
+  for (uint8_t addr = 0x20; addr <= 0x3F; addr++) {
+    if (addr > 0x27 && addr < 0x38) continue;   // LCD backpacks only use 0x20-0x27 or 0x38-0x3F
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) { found = addr; break; }
+  }
+  if (found == 0) {
+    Serial.println("LCD NOT FOUND on I2C - check SDA (GPIO21), SCL (GPIO22), VCC (5V) and GND wires");
+    found = LCD_ADDRESS;
+  } else {
+    Serial.print("LCD found at address 0x");
+    Serial.println(found, HEX);
+  }
+  lcdPtr = new LiquidCrystal_I2C(found, LCD_COLS, LCD_ROWS);
+  lcd.init();
+  lcd.backlight();
+}
 
 // ---------------------------------------------------------------------
 // LIVE SENSOR STATE
@@ -1411,8 +1432,7 @@ void setup() {
   probeServo.write(SERVO_UP_ANGLE);
 
   Wire.begin(21, 22);
-  lcd.init();
-  lcd.backlight();
+  lcdBegin();
   lcd.setCursor(0, 0);
   lcd.print("Aestra Rover");
   lcd.setCursor(0, 1);
