@@ -2,12 +2,11 @@
 
 ## 1. Battery
 
-| **Battery Terminal** | **Connection** |
-|:---|:---|
-| **Battery +ve** | Button |
-| **Battery -ve** | Two terminals: | **i)** | Buck Converter IN- |
-                                   | **ii)** | GND power rail (breadboard) |
-
+| **Battery Terminal** | **Terminal** | **Connection** |
+|:---|:---:|:---|
+| **Battery +ve** | — | Button |
+| **Battery -ve** | **i)** | Buck Converter IN- |
+| | **ii)** | GND power rail (breadboard) |
 
 ---
 
@@ -43,8 +42,6 @@
 | **No.** | **Connection** | **Terminal** |
 |:---:|:---|:---|
 | **1** | Battery | +ve (12V) |
-**Two terminals:**
+| **Two terminals:** | | |
 | **2(i)** | Buck converter | IN+ |
 | **2(ii)** | L298N Module | +12V |
-
-
