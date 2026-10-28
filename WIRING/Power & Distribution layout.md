@@ -5,9 +5,9 @@
 | **Battery Terminal** | **Connection** |
 |:---|:---|
 | **Battery +ve** | Button |
-| **Battery -ve** | Two terminals: |
-| **i)** | Buck Converter IN- |
-| **ii)** | GND power rail (breadboard) |
+| **Battery -ve** | Two terminals: | **i)** | Buck Converter IN- |
+                                   | **ii)** | GND power rail (breadboard) |
+
 
 ---
 
